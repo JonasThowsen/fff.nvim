@@ -50,6 +50,42 @@ For any file search or grep in the current git indexed directory use fff tools
 
 This fork also ships an Emacs frontend that reuses the Rust search core and swaps the Neovim/Lua layer for an elisp package plus a small helper process.
 
+### Nix / flake install
+
+If you are using this `emacs` branch directly, point your flake input at that branch:
+
+```nix
+inputs.fff-emacs.url = "github:JonasThowsen/fff.nvim?ref=emacs";
+```
+
+Then install the packaged frontend/helper from the flake:
+
+```nix
+environment.systemPackages = [
+  inputs.fff-emacs.packages.${pkgs.stdenv.hostPlatform.system}.fff-emacs
+];
+```
+
+Available flake packages:
+
+- `fff-emacs` - helper binary plus elisp files
+- `fff-emacs-helper` - just the Rust helper binary
+- `fff-emacs-elisp` - just the elisp frontend
+- `fff-nvim` - the Neovim plugin package
+
+### Non-Nix install
+
+You can also install the elisp and helper separately from GitHub:
+
+```bash
+cargo install --git https://github.com/JonasThowsen/fff.nvim --branch emacs --features zlob fff-emacs
+```
+
+```elisp
+(use-package fff
+  :load-path "/path/to/fff.nvim/emacs")
+```
+
 ### Build the helper
 
 ```bash
