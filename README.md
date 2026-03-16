@@ -65,6 +65,10 @@ cargo build --release --bin fff-emacs --features zlob
 ;; Optional if `fff-emacs` is not on your exec-path.
 (setq fff-helper-command '("/path/to/fff.nvim/target/release/fff-emacs"))
 
+;; Optional: choose the grep mode order. The first entry is the default for
+;; `fff-live-grep`, and Shift-Tab cycles through the list in-picker.
+(setq fff-grep-mode-cycle '("plain" "fuzzy" "regex"))
+
 (global-set-key (kbd "C-c f f") #'fff-find-files)
 (global-set-key (kbd "C-c f g") #'fff-live-grep)
 ```
@@ -73,15 +77,13 @@ cargo build --release --bin fff-emacs --features zlob
 
 - `M-x fff-find-files`
 - `M-x fff-live-grep`
-- `M-x fff-live-grep-regexp`
-- `M-x fff-live-grep-fuzzy`
 - `M-x fff-status`
 - `M-x fff-rescan`
 - `M-x fff-refresh-git-status`
 
 The Emacs integration is intentionally editor-native rather than a 1:1 floating-window port of the Neovim picker: file and grep search both open an interactive picker buffer with a live side preview.
 
-Inside the picker, type to refine the query live, use `n`/`p` or arrow keys to move, `RET` to open, `DEL` to delete a character, `C-w` to delete the last word, `C-u` to clear the query, and `q` to quit. A side preview window updates as you move.
+Inside the picker, type to refine the query live, use `C-n`/`C-p` or arrows to move, `RET` to open, `C-s`/`C-v` to open in splits, `C-u`/`C-d` to scroll the preview, `DEL` to delete a character, `C-w` to delete the last word, `C-k` to clear the query, `S-TAB` to cycle grep modes, and `C-g` to quit.
 
 ## Neovim guide
 

@@ -42,6 +42,15 @@ executable path string or a full command list."
   :type 'integer
   :group 'fff)
 
+(defcustom fff-grep-mode-cycle '("plain" "fuzzy" "regex")
+  "Ordered grep modes used by `fff-live-grep' and Shift-Tab cycling.
+
+The first entry is the default mode for `fff-live-grep'."
+  :type '(repeat (choice (const "plain")
+                         (const "fuzzy")
+                         (const "regex")))
+  :group 'fff)
+
 (defcustom fff-request-timeout 10
   "Seconds to wait for helper responses before failing."
   :type 'number
@@ -57,18 +66,9 @@ executable path string or a full command list."
   :type 'number
   :group 'fff)
 
-(defcustom fff-preview-window-size 0.28
-  "Size of the preview side window.
-
-When the preview is shown at the bottom, values between 0 and 1 are treated
-as a fraction of the frame height."
-  :type 'number
-  :group 'fff)
-
-(defcustom fff-preview-window-side 'bottom
-  "Where to show the preview window."
-  :type '(choice (const :tag "Bottom" bottom)
-                 (const :tag "Right" right))
+(defcustom fff-picker-window-height 14
+  "Height of the bottom picker window in lines."
+  :type 'integer
   :group 'fff)
 
 (defface fff-file-name-face
@@ -113,13 +113,17 @@ as a fraction of the frame height."
   status
   last-error
   truncated
+  origin-window
+  origin-buffer
+  picker-window
   preview-buffer
   preview-path
   refresh-timer
   debounce-timer
   preview-timer
   request-token
-  loading)
+  loading
+  preview-frozen)
 
 (defvar fff--sessions (make-hash-table :test #'equal))
 (defvar fff--find-history nil)
@@ -392,17 +396,26 @@ as a fraction of the frame height."
     ('grep (format "*fff-grep:%s*" mode))
     (_ "*fff*")))
 
-(defun fff--display-picker-buffer (buffer)
-  (pop-to-buffer buffer '(display-buffer-reuse-window display-buffer-pop-up-window)))
+(defun fff--ensure-picker-layout (picker buffer)
+  (let* ((origin-window (or (fff--picker-origin-window picker) (selected-window)))
+         (live-origin (if (window-live-p origin-window) origin-window (selected-window)))
+         (picker-window (or (fff--picker-picker-window picker)
+                            (split-window live-origin (- fff-picker-window-height) 'below))))
+    (setf (fff--picker-origin-window picker) live-origin
+          (fff--picker-picker-window picker) picker-window)
+    (set-window-buffer picker-window buffer)
+    (set-window-dedicated-p picker-window t)
+    (select-window picker-window)
+    picker-window))
 
-(defun fff--display-preview-window (buffer)
-  (display-buffer-in-side-window
-   buffer
-   `((side . ,fff-preview-window-side)
-     (slot . 1)
-     ,@(if (eq fff-preview-window-side 'right)
-           `((window-width . ,fff-preview-window-size))
-         `((window-height . ,fff-preview-window-size))))))
+(defun fff--preview-window (picker)
+  (let ((window (fff--picker-origin-window picker)))
+    (cond
+     ((window-live-p window) window)
+     ((window-live-p (fff--picker-picker-window picker))
+      (or (window-in-direction 'above (fff--picker-picker-window picker))
+          (selected-window)))
+     (t (selected-window)))))
 
 (defun fff--goto-location (location)
   (when location
@@ -474,7 +487,7 @@ as a fraction of the frame height."
   (when item
     (let* ((path (gethash "path" item))
            (preview (fff--ensure-preview-buffer picker path))
-           (window (fff--display-preview-window preview)))
+           (window (fff--preview-window picker)))
       (save-selected-window
         (select-window window)
         (switch-to-buffer preview)
@@ -538,6 +551,24 @@ as a fraction of the frame height."
               ""
             (fff--picker-query picker))))
 
+(defun fff--default-grep-mode ()
+  (let ((mode (fff--normalize-grep-mode (car fff-grep-mode-cycle))))
+    (or mode "plain")))
+
+(defun fff--normalize-grep-mode (mode)
+  (pcase mode
+    ((or "plain" 'plain) "plain")
+    ((or "fuzzy" 'fuzzy) "fuzzy")
+    ((or "regex" 'regex) "regex")
+    (_ nil)))
+
+(defun fff--next-grep-mode (mode)
+  (let* ((modes (delq nil (mapcar #'fff--normalize-grep-mode fff-grep-mode-cycle)))
+         (modes (or (cl-remove-duplicates modes :test #'equal)
+                    '("plain" "fuzzy" "regex")))
+         (index (cl-position (fff--normalize-grep-mode mode) modes :test #'equal)))
+    (nth (mod (1+ (or index -1)) (length modes)) modes)))
+
 (defun fff--picker-status-text (picker)
   (cond
    ((fff--picker-loading picker) "loading")
@@ -548,11 +579,11 @@ as a fraction of the frame height."
   (if (not fff--picker)
       ""
     (format
-     " FFF %s  [%s]  query: %s  matches: %d  RET open  C-s split-below  C-v split-right  C-n/C-p move  DEL delete  C-w word  C-u clear  C-l refresh  C-g quit "
+     " FFF %s  [%s]  query: %s  matches: %d  RET open  C-s split-below  C-v split-right  C-n/C-p move  C-u/C-d preview  DEL delete  C-w word  C-k clear  C-l refresh  C-g quit "
      (pcase (fff--picker-kind fff--picker)
-       ('files "files")
-       ('grep (format "grep:%s" (fff--picker-mode fff--picker)))
-       (_ "picker"))
+        ('files "files")
+        ('grep (format "grep:%s  S-TAB cycle" (fff--picker-mode fff--picker)))
+        (_ "picker"))
      (fff--picker-status-text fff--picker)
      (if (string-empty-p (fff--picker-query fff--picker)) "<empty>" (fff--picker-query fff--picker))
      (length (fff--picker-items fff--picker)))))
@@ -599,7 +630,9 @@ as a fraction of the frame height."
   (when (and fff--picker
              (timerp (fff--picker-preview-timer fff--picker)))
     (cancel-timer (fff--picker-preview-timer fff--picker)))
-  (when (and fff--picker (fff--picker-items fff--picker))
+  (when (and fff--picker
+             (not (fff--picker-preview-frozen fff--picker))
+             (fff--picker-items fff--picker))
     (setf (fff--picker-preview-timer fff--picker)
           (run-with-timer
            fff-preview-delay
@@ -641,7 +674,8 @@ as a fraction of the frame height."
         (if (fff--picker-items fff--picker)
             (progn
               (fff--picker-sync-selection-from-point)
-              (fff--picker-schedule-preview))
+              (unless (fff--picker-preview-frozen fff--picker)
+                (fff--picker-schedule-preview)))
           (fff--picker-request-status buffer fff--picker token))))))
 
 (defun fff--picker-request-grep-page (buffer picker token items file-offset truncated)
@@ -685,18 +719,21 @@ as a fraction of the frame height."
            (fff--picker-request-grep-page
             buffer picker token all-items next-offset truncated)))))))
 
-(defun fff--picker-refresh ()
+(defun fff--picker-refresh (&optional background)
   (interactive)
   (unless fff--picker
     (user-error "No active fff picker"))
   (let* ((picker fff--picker)
          (buffer (current-buffer))
-         (token (1+ (or (fff--picker-request-token picker) 0))))
+         (token (1+ (or (fff--picker-request-token picker) 0)))
+         (show-loading (and (not background)
+                            (null (fff--picker-items picker)))))
     (setf (fff--picker-request-token picker) token
-          (fff--picker-loading picker) t
-          (fff--picker-last-error picker) nil
-          (fff--picker-status picker) nil)
-    (fff--picker-render)
+          (fff--picker-loading picker) show-loading
+          (fff--picker-last-error picker) nil)
+    (when show-loading
+      (setf (fff--picker-status picker) nil)
+      (fff--picker-render))
     (pcase (fff--picker-kind picker)
       ('files
        (fff--request-async
@@ -730,24 +767,25 @@ as a fraction of the frame height."
       ('grep
        (fff--picker-request-grep-page buffer picker token '() 0 nil)))))
 
-(defun fff--picker-request-refresh (&optional immediate)
+(defun fff--picker-request-refresh (&optional immediate background)
   (unless fff--picker
     (user-error "No active fff picker"))
   (when (timerp (fff--picker-debounce-timer fff--picker))
     (cancel-timer (fff--picker-debounce-timer fff--picker)))
   (if immediate
-      (fff--picker-refresh)
+      (fff--picker-refresh background)
     (setf (fff--picker-debounce-timer fff--picker)
           (run-with-timer
            fff-query-debounce-delay
            nil
-           (lambda (buffer)
+           (lambda (buffer delayed-background)
              (when (buffer-live-p buffer)
                (with-current-buffer buffer
                  (when fff--picker
-                   (setf (fff--picker-debounce-timer fff--picker) nil)
-                   (fff--picker-refresh)))))
-           (current-buffer)))))
+                    (setf (fff--picker-debounce-timer fff--picker) nil)
+                   (fff--picker-refresh delayed-background)))))
+           (current-buffer)
+           background))))
 
 (defun fff--picker-post-command ()
   (when (and (derived-mode-p 'fff-picker-mode)
@@ -760,6 +798,7 @@ as a fraction of the frame height."
     (let ((before (fff--picker-selected-index fff--picker)))
       (fff--picker-sync-selection-from-point)
       (unless (equal before (fff--picker-selected-index fff--picker))
+        (setf (fff--picker-preview-frozen fff--picker) nil)
         (fff--picker-schedule-preview)))))
 
 (defvar fff-picker-mode-map
@@ -774,9 +813,15 @@ as a fraction of the frame height."
     (define-key map (kbd "C-v") #'fff-picker-open-vertical)
     (define-key map (kbd "C-g") #'fff-picker-quit)
     (define-key map (kbd "<escape>") #'fff-picker-quit)
+    (define-key map (kbd "<backtab>") #'fff-picker-cycle-grep-mode)
+    (define-key map (kbd "S-<tab>") #'fff-picker-cycle-grep-mode)
+    (define-key map [backtab] #'fff-picker-cycle-grep-mode)
+    (define-key map [iso-lefttab] #'fff-picker-cycle-grep-mode)
+    (define-key map (kbd "C-d") #'fff-picker-preview-half-page-down)
     (define-key map (kbd "C-w") #'fff-picker-delete-word)
-    (define-key map (kbd "C-u") #'fff-picker-clear-query)
-    (define-key map (kbd "C-l") (lambda () (interactive) (fff--picker-request-refresh t)))
+    (define-key map (kbd "C-u") #'fff-picker-preview-half-page-up)
+    (define-key map (kbd "C-k") #'fff-picker-clear-query)
+    (define-key map (kbd "C-l") (lambda () (interactive) (fff--picker-request-refresh t nil)))
     (define-key map (kbd "RET") #'fff-picker-open)
     (define-key map (kbd "<down>") #'next-line)
     (define-key map (kbd "<up>") #'previous-line)
@@ -811,15 +856,23 @@ as a fraction of the frame height."
              (buffer-live-p (fff--picker-preview-buffer fff--picker)))
     (kill-buffer (fff--picker-preview-buffer fff--picker))
     (setf (fff--picker-preview-buffer fff--picker) nil
-          (fff--picker-preview-path fff--picker) nil)))
+          (fff--picker-preview-path fff--picker) nil))
+  (when (and fff--picker
+             (window-live-p (fff--picker-picker-window fff--picker)))
+    (set-window-dedicated-p (fff--picker-picker-window fff--picker) nil))
+  (when (and fff--picker
+             (window-live-p (fff--picker-origin-window fff--picker))
+             (buffer-live-p (fff--picker-origin-buffer fff--picker)))
+    (set-window-buffer (fff--picker-origin-window fff--picker)
+                       (fff--picker-origin-buffer fff--picker))))
 
 (defun fff--picker-auto-refresh-tick (buffer)
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (and fff--picker
-                 (or (null (fff--picker-status fff--picker))
-                      (gethash "is_scanning" (fff--picker-status fff--picker))))
-        (ignore-errors (fff--picker-request-refresh t))))))
+                 (fff--picker-status fff--picker)
+                 (gethash "is_scanning" (fff--picker-status fff--picker)))
+        (ignore-errors (fff--picker-request-refresh t t))))))
 
 (defun fff--picker-start-auto-refresh ()
   (when (and fff--picker
@@ -830,8 +883,15 @@ as a fraction of the frame height."
 (defun fff-picker-quit ()
   "Quit the active fff picker and close its preview."
   (interactive)
-  (fff--picker-cleanup)
-  (quit-window t))
+  (let ((picker fff--picker)
+        (buffer (current-buffer)))
+    (fff--picker-cleanup)
+    (when (and picker (window-live-p (fff--picker-picker-window picker)))
+      (delete-window (fff--picker-picker-window picker)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (remove-hook 'kill-buffer-hook #'fff--picker-cleanup t))
+      (kill-buffer buffer))))
 
 (defun fff-picker-self-insert (n)
   "Append typed characters to the picker query and refresh."
@@ -841,7 +901,8 @@ as a fraction of the frame height."
   (let ((chars (make-string n last-command-event)))
     (setf (fff--picker-query fff--picker)
           (concat (fff--picker-query fff--picker) chars)
-          (fff--picker-selected-index fff--picker) 0)
+          (fff--picker-selected-index fff--picker) 0
+          (fff--picker-preview-frozen fff--picker) nil)
     (fff--picker-request-refresh)))
 
 (defun fff-picker-backspace ()
@@ -852,7 +913,8 @@ as a fraction of the frame height."
   (when (> (length (fff--picker-query fff--picker)) 0)
     (setf (fff--picker-query fff--picker)
           (substring (fff--picker-query fff--picker) 0 -1)
-          (fff--picker-selected-index fff--picker) 0)
+          (fff--picker-selected-index fff--picker) 0
+          (fff--picker-preview-frozen fff--picker) nil)
     (fff--picker-request-refresh)))
 
 (defun fff-picker-delete-word ()
@@ -865,7 +927,8 @@ as a fraction of the frame height."
                    (replace-match "" t t query)
                  "")))
     (setf (fff--picker-query fff--picker) (string-trim-right next)
-          (fff--picker-selected-index fff--picker) 0)
+          (fff--picker-selected-index fff--picker) 0
+          (fff--picker-preview-frozen fff--picker) nil)
     (fff--picker-request-refresh)))
 
 (defun fff-picker-clear-query ()
@@ -874,18 +937,73 @@ as a fraction of the frame height."
   (unless fff--picker
     (user-error "No active fff picker"))
   (setf (fff--picker-query fff--picker) ""
-        (fff--picker-selected-index fff--picker) 0)
+        (fff--picker-selected-index fff--picker) 0
+        (fff--picker-preview-frozen fff--picker) nil)
   (fff--picker-request-refresh))
 
-(defun fff--picker-open-file (path location &optional opener)
-  (funcall (or opener #'find-file) path)
-  (fff--goto-location location)
-  (recenter))
+(defun fff--scroll-preview (direction)
+  (unless fff--picker
+    (user-error "No active fff picker"))
+  (when (timerp (fff--picker-preview-timer fff--picker))
+    (cancel-timer (fff--picker-preview-timer fff--picker))
+    (setf (fff--picker-preview-timer fff--picker) nil))
+  (setf (fff--picker-preview-frozen fff--picker) t)
+  (let ((window (fff--preview-window fff--picker)))
+    (when (window-live-p window)
+      (save-selected-window
+        (select-window window)
+        (condition-case nil
+            (progn
+              (funcall direction (/ (max 2 (window-body-height window)) 2))
+              (goto-char (window-start window))
+              (forward-line (/ (max 2 (window-body-height window)) 2))
+              (set-window-point window (point)))
+          (error nil))))))
 
-(defun fff--picker-open-grep (item &optional opener)
-  (funcall (or opener #'find-file) (gethash "path" item))
-  (fff--goto-grep-item item)
-  (recenter))
+(defun fff-picker-preview-half-page-down ()
+  "Scroll the preview window down by half a page."
+  (interactive)
+  (fff--scroll-preview #'scroll-up-command))
+
+(defun fff-picker-preview-half-page-up ()
+  "Scroll the preview window up by half a page."
+  (interactive)
+  (fff--scroll-preview #'scroll-down-command))
+
+(defun fff-picker-cycle-grep-mode ()
+  "Cycle the active grep picker to the next configured grep mode."
+  (interactive)
+  (unless (and fff--picker (eq (fff--picker-kind fff--picker) 'grep))
+    (user-error "Not in an fff grep picker"))
+  (setf (fff--picker-mode fff--picker) (fff--next-grep-mode (fff--picker-mode fff--picker))
+        (fff--picker-selected-index fff--picker) 0
+        (fff--picker-truncated fff--picker) nil
+        (fff--picker-last-error fff--picker) nil
+        (fff--picker-preview-frozen fff--picker) nil)
+  (fff--picker-request-refresh t nil))
+
+
+(defun fff--picker-run-opener (picker opener path)
+  (let ((window (fff--preview-window picker)))
+    (save-selected-window
+      (select-window window)
+      (funcall (or opener #'find-file) path))))
+
+(defun fff--picker-open-file (picker path location &optional opener)
+  (fff--picker-run-opener picker opener path)
+  (let ((window (fff--preview-window picker)))
+    (save-selected-window
+      (select-window window)
+      (fff--goto-location location)
+      (recenter))))
+
+(defun fff--picker-open-grep (picker item &optional opener)
+  (fff--picker-run-opener picker opener (gethash "path" item))
+  (let ((window (fff--preview-window picker)))
+    (save-selected-window
+      (select-window window)
+      (fff--goto-grep-item item)
+      (recenter))))
 
 (defun fff--picker-open (opener)
   (interactive)
@@ -907,15 +1025,19 @@ as a fraction of the frame height."
                       `(("query" . ,query)
                         ("path" . ,(gethash "path" item))))))
     (fff--picker-cleanup)
-    (quit-window t)
+    (when (window-live-p (fff--picker-picker-window picker))
+      (delete-window (fff--picker-picker-window picker)))
     (pcase kind
       ('files
        (fff--picker-open-file
+        picker
         (gethash "path" item)
         location
         opener))
-      ('grep (fff--picker-open-grep item opener)))
+      ('grep (fff--picker-open-grep picker item opener)))
     (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (remove-hook 'kill-buffer-hook #'fff--picker-cleanup t))
       (kill-buffer buffer))))
 
 (defun fff-picker-open ()
@@ -942,24 +1064,29 @@ as a fraction of the frame height."
   (fff--picker-open #'fff--find-file-vertical))
 
 (defun fff--open-picker (kind &optional mode initial-query)
-  (let* ((session (fff--ensure-session))
+  (let* ((origin-window (selected-window))
+         (origin-buffer (window-buffer origin-window))
+         (session (fff--ensure-session))
          (buffer (get-buffer-create (fff--picker-buffer-name kind mode)))
          (picker (fff--make-picker
-                  :kind kind
-                  :mode mode
-                  :session session
-                  :root (fff--session-root session)
-                  :query (or initial-query "")
-                  :items nil
-                  :selected-index 0)))
+                   :kind kind
+                   :mode mode
+                   :session session
+                   :root (fff--session-root session)
+                   :origin-window origin-window
+                   :origin-buffer origin-buffer
+                   :query (or initial-query "")
+                   :items nil
+                   :selected-index 0)))
     (with-current-buffer buffer
       (setq-local default-directory (fff--session-root session))
       (fff-picker-mode)
       (setq-local fff--picker picker)
       (add-hook 'kill-buffer-hook #'fff--picker-cleanup nil t)
+      (fff--ensure-picker-layout picker buffer)
       (fff--picker-start-auto-refresh)
       (fff--picker-refresh))
-    (fff--display-picker-buffer buffer)))
+    buffer))
 
 (with-eval-after-load 'evil
   (when (fboundp 'evil-set-initial-state)
@@ -971,9 +1098,9 @@ as a fraction of the frame height."
   (fff--open-picker 'files nil initial-query))
 
 (defun fff-live-grep (&optional initial-query)
-  "Open the plain-text grep picker with live preview."
+  "Open the grep picker with the first configured mode and live preview."
   (interactive)
-  (fff--open-picker 'grep "plain" initial-query))
+  (fff--open-picker 'grep (fff--default-grep-mode) initial-query))
 
 (defun fff-live-grep-regexp (&optional initial-query)
   "Open the regex grep picker with live preview."
