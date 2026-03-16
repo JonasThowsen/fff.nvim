@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="#mcp"><strong>AI agents (MCP)</strong></a> &nbsp;&nbsp;|&nbsp;&nbsp; <a href="#neovim-guide"><strong>Neovim users</strong></a>
+  <a href="#mcp"><strong>AI agents (MCP)</strong></a> &nbsp;&nbsp;|&nbsp;&nbsp; <a href="#emacs-guide"><strong>Emacs users</strong></a> &nbsp;&nbsp;|&nbsp;&nbsp; <a href="#neovim-guide"><strong>Neovim users</strong></a>
 </p>
 
 <p align="center">
@@ -45,6 +45,43 @@ Here is an example addition to `CLAUDE.md` that works perfectly:
 # CLAUDE.md
 For any file search or grep in the current git indexed directory use fff tools
 ```
+
+## Emacs guide
+
+This fork also ships an Emacs frontend that reuses the Rust search core and swaps the Neovim/Lua layer for an elisp package plus a small helper process.
+
+### Build the helper
+
+```bash
+cargo build --release --bin fff-emacs --features zlob
+```
+
+### Load the elisp package
+
+```elisp
+(add-to-list 'load-path "/path/to/fff.nvim/emacs")
+(require 'fff)
+
+;; Optional if `fff-emacs` is not on your exec-path.
+(setq fff-helper-command '("/path/to/fff.nvim/target/release/fff-emacs"))
+
+(global-set-key (kbd "C-c f f") #'fff-find-files)
+(global-set-key (kbd "C-c f g") #'fff-live-grep)
+```
+
+### Available commands
+
+- `M-x fff-find-files`
+- `M-x fff-live-grep`
+- `M-x fff-live-grep-regexp`
+- `M-x fff-live-grep-fuzzy`
+- `M-x fff-status`
+- `M-x fff-rescan`
+- `M-x fff-refresh-git-status`
+
+The Emacs integration is intentionally editor-native rather than a 1:1 floating-window port of the Neovim picker: file and grep search both open an interactive picker buffer with a live side preview.
+
+Inside the picker, type to refine the query live, use `n`/`p` or arrow keys to move, `RET` to open, `DEL` to delete a character, `C-w` to delete the last word, `C-u` to clear the query, and `q` to quit. A side preview window updates as you move.
 
 ## Neovim guide
 
