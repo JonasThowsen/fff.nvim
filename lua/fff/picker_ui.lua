@@ -48,6 +48,8 @@ M.state = {
   top = 1,
   query = '',
   line_to_item = {},
+  item_to_lines = {},
+  last_render_ctx = nil,
   location = nil, -- Current location from search results
 
   -- History cycling state
@@ -954,24 +956,30 @@ function M.load_previous_page()
   return M.load_page_at_index(new_page_index, function(result_count) M.state.cursor = result_count end)
 end
 
+local function close_preview_timer(timer)
+  timer = timer or M.state.preview_timer
+  if not timer then return end
+
+  if M.state.preview_timer == timer then M.state.preview_timer = nil end
+  if timer:is_closing() then return end
+
+  timer:stop()
+  timer:close()
+end
+
 function M.update_preview_debounced()
-  -- Cancel previous preview timer
-  if M.state.preview_timer then
-    M.state.preview_timer:stop()
-    M.state.preview_timer:close()
-    M.state.preview_timer = nil
-  end
+  close_preview_timer()
 
   -- Create new timer with longer debounce for expensive preview
-  M.state.preview_timer = vim.uv.new_timer()
-  M.state.preview_timer:start(
+  local timer = vim.uv.new_timer()
+  M.state.preview_timer = timer
+  timer:start(
     M.state.preview_debounce_ms,
     0,
     vim.schedule_wrap(function()
-      if M.state.active then
-        M.update_preview()
-        M.state.preview_timer = nil
-      end
+      local is_current = M.state.preview_timer == timer
+      close_preview_timer(timer)
+      if is_current and M.state.active then M.update_preview() end
     end)
   )
 end
@@ -1297,11 +1305,15 @@ function M.render_list()
   local ctx = build_render_context()
   if M.state.mode == 'grep' and #ctx.items == 0 then
     M.state.line_to_item = {}
+    M.state.item_to_lines = {}
+    M.state.last_render_ctx = nil
     render_grep_empty_state(ctx)
     return
   end
 
   local item_to_lines, separator_line = list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
+  M.state.item_to_lines = item_to_lines
+  M.state.last_render_ctx = ctx
 
   local line_to_item = {}
   for item_idx, mapping in pairs(item_to_lines) do
@@ -1655,11 +1667,61 @@ function M.wrap_to_last()
   return true
 end
 
+local function rerender_cursor_rows(old_cursor, new_cursor)
+  if M.state.suggestion_source then return false end
+  if not (M.state.list_buf and vim.api.nvim_buf_is_valid(M.state.list_buf)) then return false end
+  if not (M.state.list_win and vim.api.nvim_win_is_valid(M.state.list_win)) then return false end
+  if not (M.state.item_to_lines and M.state.last_render_ctx and M.state.ns_id) then return false end
+
+  local ctx = M.state.last_render_ctx
+  if ctx.items ~= M.state.filtered_items then return false end
+
+  local old_lines = M.state.item_to_lines[old_cursor]
+  local new_lines = M.state.item_to_lines[new_cursor]
+  if not old_lines or not new_lines then return false end
+
+  local renderer = ctx.renderer or require('fff.file_renderer')
+  local entries = {
+    { item_idx = old_cursor, lines = old_lines },
+    { item_idx = new_cursor, lines = new_lines },
+  }
+
+  for _, entry in ipairs(entries) do
+    entry.item = ctx.items[entry.item_idx]
+    if not entry.item then return false end
+
+    local line_idx = entry.lines.last
+    entry.line = vim.api.nvim_buf_get_lines(M.state.list_buf, line_idx - 1, line_idx, false)[1]
+    if not entry.line then return false end
+  end
+
+  ctx.cursor = new_cursor
+  for _, entry in ipairs(entries) do
+    vim.api.nvim_buf_clear_namespace(M.state.list_buf, M.state.ns_id, entry.lines.first - 1, entry.lines.last)
+    renderer.apply_highlights(
+      entry.item,
+      ctx,
+      entry.item_idx,
+      M.state.list_buf,
+      M.state.ns_id,
+      entry.lines.last,
+      entry.line
+    )
+  end
+
+  vim.api.nvim_win_set_cursor(M.state.list_win, { new_lines.last, 0 })
+  return true
+end
+
+local function render_after_cursor_move(old_cursor)
+  if old_cursor == M.state.cursor then return false end
+  if old_cursor and rerender_cursor_rows(old_cursor, M.state.cursor) then return true end
+  M.render_list()
+  return true
+end
+
 --- After cursor moves, decide whether the combo separator should hide.
---- Hide rule: cursor has moved more than 50% of a page *past* the separator
---- anchor (in the direction away from it). Direction-agnostic w.r.t. prompt
---- position because we measure against the item index of the anchor, not its
---- visual row.
+--- Hide rule: cursor moved more than 50% of a page past the separator anchor.
 local function maybe_hide_combo_separator()
   if not (M.state.combo_initial_cursor and M.state.combo_visible) then return end
   local distance_past = M.state.cursor - M.state.combo_initial_cursor
@@ -1682,6 +1744,7 @@ function M.move_up()
 
   local prompt_position = get_prompt_position()
   local items_count = #M.state.filtered_items
+  local old_cursor = M.state.cursor
   local wrap_around = M.state.config and M.state.config.wrap_around or false
 
   -- Pagination logic depends on prompt position
@@ -1730,13 +1793,10 @@ function M.move_up()
     end
   end
 
-  M.render_list()
-  if M.state.mode == 'grep' or M.state.suggestion_source == 'grep' then
-    M.update_preview_smart()
-  else
-    M.update_preview()
-  end
+  if not render_after_cursor_move(old_cursor) then return end
   M.update_status()
+  pcall(vim.cmd, 'redraw')
+  M.update_preview_debounced()
 
   maybe_hide_combo_separator()
 end
@@ -1747,6 +1807,7 @@ function M.move_down()
 
   local prompt_position = get_prompt_position()
   local items_count = #M.state.filtered_items
+  local old_cursor = M.state.cursor
   local wrap_around = M.state.config and M.state.config.wrap_around or false
 
   -- Pagination logic depends on prompt position
@@ -1795,13 +1856,10 @@ function M.move_down()
     end
   end
 
-  M.render_list()
-  if M.state.mode == 'grep' or M.state.suggestion_source == 'grep' then
-    M.update_preview_smart()
-  else
-    M.update_preview()
-  end
+  if not render_after_cursor_move(old_cursor) then return end
   M.update_status()
+  pcall(vim.cmd, 'redraw')
+  M.update_preview_debounced()
 
   maybe_hide_combo_separator()
 end
@@ -2289,11 +2347,7 @@ function M.close()
     end
   end
 
-  if M.state.preview_timer then
-    M.state.preview_timer:stop()
-    M.state.preview_timer:close()
-    M.state.preview_timer = nil
-  end
+  close_preview_timer()
 
   M.state.input_win = nil
   M.state.list_win = nil
@@ -2306,6 +2360,9 @@ function M.close()
   M.state.preview_visible = false
   M.state.items = {}
   M.state.filtered_items = {}
+  M.state.line_to_item = {}
+  M.state.item_to_lines = {}
+  M.state.last_render_ctx = nil
   M.state.cursor = 1
   M.state.query = ''
   M.state.ns_id = nil
